@@ -1,0 +1,17 @@
+# Deploy do OneImport no Render. DATABASE_URL é a única variável obrigatória
+# para a aplicação web (o tenant agora vem do login, tabela `usuarios` — ver
+# database.py). TENANT_ID só é necessário se você também for rodar o
+# orquestrador via linha de comando (main.py) nesta mesma máquina/serviço,
+# sem passar pela tela de login.
+services:
+  - type: web
+    name: oneimport
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: streamlit run src/app.py --server.port $PORT --server.address 0.0.0.0
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: DATABASE_URL
+        sync: false

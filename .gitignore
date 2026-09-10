@@ -1,0 +1,14 @@
+# Segredos — nunca versionar
+.streamlit/secrets.toml
+src/.streamlit/secrets.toml
+.env
+endereço.txt
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Banco de regras local (SQLite) — obsoleto após a migração para Supabase/Postgres
+*.db
