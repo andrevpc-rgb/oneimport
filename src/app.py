@@ -592,10 +592,27 @@ with st.sidebar:
         unsafe_allow_html=True,
     )
 
-    col_escritorio, col_sair = st.columns([3, 1])
+    col_escritorio, col_senha, col_sair = st.columns([3, 1, 1])
     with col_escritorio:
         st.caption(f"🏢 {st.session_state.get('nome_escritorio', '')}")
         st.caption(st.session_state.get("usuario_email", ""))
+    with col_senha:
+        with st.popover("🔑", help="Trocar senha"):
+            with st.form("form_trocar_senha", clear_on_submit=True):
+                senha_atual_troca = st.text_input("Senha atual", type="password")
+                senha_nova_troca = st.text_input("Nova senha", type="password")
+                senha_nova_confirma_troca = st.text_input("Confirmar nova senha", type="password")
+                if st.form_submit_button("Salvar nova senha"):
+                    if senha_nova_troca != senha_nova_confirma_troca:
+                        st.error("As senhas não coincidem.")
+                    else:
+                        try:
+                            database.UsuariosDB().trocar_senha(
+                                st.session_state["tenant_id"], senha_atual_troca, senha_nova_troca
+                            )
+                            st.success("Senha atualizada!")
+                        except (database.UsuarioInvalidoError, database.ConfiguracaoAusenteError) as exc:
+                            st.error(str(exc))
     with col_sair:
         if st.button("Sair", key="botao_logout"):
             for chave in ("tenant_id", "usuario_email", "nome_escritorio"):

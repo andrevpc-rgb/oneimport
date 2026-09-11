@@ -237,6 +237,22 @@ class UsuariosDB:
 
         return {"id": str(linha["id"]), "email": linha["email"], "nome_escritorio": linha["nome_escritorio"]}
 
+    def trocar_senha(self, tenant_id: str, senha_atual: str, nova_senha: str) -> None:
+        """Confere `senha_atual` e grava o hash da `nova_senha`. Levanta UsuarioInvalidoError se a atual estiver errada ou a nova for fraca."""
+        if not nova_senha or len(nova_senha) < 6:
+            raise UsuarioInvalidoError("A nova senha precisa ter pelo menos 6 caracteres.")
+
+        sql_busca = text("SELECT senha_hash FROM usuarios WHERE id = :id")
+        with self._engine.connect() as conn:
+            linha = conn.execute(sql_busca, {"id": tenant_id}).mappings().first()
+
+        if linha is None or not linha["senha_hash"] or not _verificar_senha(senha_atual, linha["senha_hash"]):
+            raise UsuarioInvalidoError("Senha atual incorreta.")
+
+        sql_update = text("UPDATE usuarios SET senha_hash = :senha_hash WHERE id = :id")
+        with self._engine.begin() as conn:
+            conn.execute(sql_update, {"senha_hash": _hash_senha(nova_senha), "id": tenant_id})
+
 
 def _decodificar_mapeamento(valor) -> List[Dict[str, str]]:
     """mapeamento_colunas vem como JSONB — a maioria dos drivers já decodifica para list/dict sozinha."""
