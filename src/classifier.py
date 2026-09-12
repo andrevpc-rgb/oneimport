@@ -30,12 +30,13 @@ import pandas as pd
 import parser as extrator  # módulo da etapa 1: extração/padronização (parser.py)
 
 try:
-    from rapidfuzz import fuzz as _fuzz
+    from rapidfuzz import fuzz as _fuzz, process as _rf_process
 except ImportError:  # pragma: no cover
     try:
         from fuzzywuzzy import fuzz as _fuzz
     except ImportError:
         _fuzz = None
+    _rf_process = None
 
 
 # --------------------------------------------------------------------------- #
@@ -191,13 +192,18 @@ class PlanoDeContas:
     col_descricao: Optional[str]
     col_tipo_conta: Optional[str] = None
     _codigos_sinteticos: frozenset = field(default_factory=frozenset, repr=False, compare=False)
+    _codigos_validos: frozenset = field(default_factory=frozenset, repr=False, compare=False)
+    _mapa_tipo_conta: dict = field(default_factory=dict, repr=False, compare=False)
 
     def eh_analitica(self, codigo: str) -> bool:
         """
         Indica se `codigo` é uma conta analítica (recebe lançamento
         diretamente) e não uma conta sintética (grupo/totalizador, que só
         soma as contas abaixo dela). Usa a coluna de tipo/natureza quando o
-        Plano de Contas a informa explicitamente; senão, infere pela
+        Plano de Contas a informa explicitamente (via _mapa_tipo_conta,
+        pré-calculado uma única vez em ler_plano_de_contas — nunca escaneia
+        o DataFrame aqui, senão cada conta consultada custaria O(n) e a lista
+        inteira de contas analíticas ficaria O(n²)); senão, infere pela
         hierarquia do código estruturado — uma conta é sintética se algum
         outro código do plano começa com ela seguido de ponto (tem "filhos").
         """
@@ -205,15 +211,12 @@ class PlanoDeContas:
         if not codigo:
             return False
 
-        if self.col_tipo_conta:
-            col_codigo = self.col_codigo_estruturado or self.col_codigo_reduzido
-            correspondentes = self.df[self.df[col_codigo].astype(str).str.strip() == codigo]
-            if not correspondentes.empty:
-                tipo_texto = _normalizar_texto(correspondentes.iloc[0][self.col_tipo_conta])
-                if "analit" in tipo_texto:
-                    return True
-                if "sintet" in tipo_texto or "grupo" in tipo_texto or "total" in tipo_texto:
-                    return False
+        tipo_texto = self._mapa_tipo_conta.get(codigo)
+        if tipo_texto:
+            if "analit" in tipo_texto:
+                return True
+            if "sintet" in tipo_texto or "grupo" in tipo_texto or "total" in tipo_texto:
+                return False
 
         return codigo not in self._codigos_sinteticos
 
@@ -221,34 +224,43 @@ class PlanoDeContas:
         codigo = str(codigo).strip()
         if not codigo:
             return False
-        for col in (self.col_codigo_reduzido, self.col_codigo_estruturado):
-            if col and (self.df[col].astype(str).str.strip() == codigo).any():
-                return True
-        return False
+        return codigo in self._codigos_validos
 
     def validar_contas(
         self, df_lancamentos: pd.DataFrame, colunas: tuple = ("Conta débito", "Conta crédito")
     ) -> pd.DataFrame:
-        """Retorna as ocorrências de contas atribuídas que não constam do Plano de Contas."""
+        """Retorna as ocorrências de contas atribuídas que não constam do Plano de Contas (comparação vetorizada, sem laço linha a linha)."""
         inconsistencias = []
-        for indice, linha in df_lancamentos.iterrows():
-            for col in colunas:
-                codigo = str(linha.get(col, "") or "").strip()
-                if codigo and not self.existe_conta(codigo):
-                    inconsistencias.append({"linha": indice, "coluna": col, "conta_informada": codigo})
+        for col in colunas:
+            if col not in df_lancamentos.columns:
+                continue
+            codigos = df_lancamentos[col].astype(str).str.strip()
+            invalidos = codigos[(codigos != "") & (~codigos.isin(self._codigos_validos))]
+            for indice, codigo in invalidos.items():
+                inconsistencias.append({"linha": indice, "coluna": col, "conta_informada": codigo})
         return pd.DataFrame(inconsistencias, columns=["linha", "coluna", "conta_informada"])
 
     def buscar_por_descricao(self, texto: str, limiar: float = 85.0) -> Optional[str]:
-        """Busca fuzzy por uma conta cuja descrição mais se aproxime de `texto`."""
+        """Busca fuzzy por uma conta cuja descrição mais se aproxime de `texto`, usando o algoritmo em C do RapidFuzz (process.extractOne) em vez de um laço Python linha a linha."""
         col_codigo = self.col_codigo_estruturado or self.col_codigo_reduzido
         if not self.col_descricao or not col_codigo or not texto:
             return None
 
+        descricoes = self.df[self.col_descricao].tolist()
+        if _rf_process is not None and _fuzz is not None:
+            resultado_match = _rf_process.extractOne(
+                texto, descricoes, scorer=_fuzz.token_sort_ratio, score_cutoff=limiar, processor=_normalizar_texto
+            )
+            if resultado_match is None:
+                return None
+            _, _, indice = resultado_match
+            return str(self.df.iloc[indice][col_codigo]).strip()
+
         melhor_codigo, melhor_score = None, 0.0
-        for _, linha in self.df.iterrows():
-            score = _pontuacao_similaridade(texto, linha[self.col_descricao])
+        for indice, descricao in enumerate(descricoes):
+            score = _pontuacao_similaridade(texto, descricao)
             if score > melhor_score:
-                melhor_score, melhor_codigo = score, str(linha[col_codigo]).strip()
+                melhor_score, melhor_codigo = score, str(self.df.iloc[indice][col_codigo]).strip()
         return melhor_codigo if melhor_score >= limiar else None
 
 
@@ -298,6 +310,21 @@ def ler_plano_de_contas(origem: Union[str, Path, "IO"]) -> PlanoDeContas:
             if any(outro != codigo and outro.startswith(codigo + ".") for outro in codigos):
                 codigos_sinteticos.add(codigo)
 
+    # Pré-calculados uma única vez aqui (não a cada chamada de eh_analitica/existe_conta) —
+    # é o que torna a lista de contas analíticas O(n) em vez de O(n²) ao montar os seletores
+    # de conta na sidebar e no painel de revisão, que rodam a cada interação do Streamlit.
+    codigos_validos: set = set()
+    for col in (col_reduzido, col_estruturado):
+        if col:
+            codigos_validos.update(df[col].astype(str).str.strip())
+
+    mapa_tipo_conta: Dict[str, str] = {}
+    col_codigo_para_tipo = col_estruturado or col_reduzido
+    if col_tipo_conta and col_codigo_para_tipo:
+        codigos_serie = df[col_codigo_para_tipo].astype(str).str.strip()
+        for codigo_valor, tipo_valor in zip(codigos_serie, df[col_tipo_conta]):
+            mapa_tipo_conta[codigo_valor] = _normalizar_texto(tipo_valor)
+
     return PlanoDeContas(
         df=df,
         col_codigo_reduzido=col_reduzido,
@@ -305,6 +332,8 @@ def ler_plano_de_contas(origem: Union[str, Path, "IO"]) -> PlanoDeContas:
         col_descricao=col_descricao,
         col_tipo_conta=col_tipo_conta,
         _codigos_sinteticos=frozenset(codigos_sinteticos),
+        _codigos_validos=frozenset(codigos_validos),
+        _mapa_tipo_conta=mapa_tipo_conta,
     )
 
 
@@ -427,6 +456,9 @@ class ClassificadorLancamentos:
         self.plano_de_contas = plano_de_contas
         self.cnpj_empresa = cnpj_empresa
         self.limiar_confianca = limiar_confianca
+        # normalizado uma única vez aqui, não a cada lançamento — buscar_regra() já cacheia
+        # o lado das regras, isto faz o mesmo pro lado do Razão anterior no nível 2.
+        self._historico_normalizado = [_normalizar_texto(item.get("texto", "")) for item in self.mapa_historico]
 
     # -- níveis da cascata -------------------------------------------------- #
 
@@ -445,17 +477,47 @@ class ClassificadorLancamentos:
         )
 
     def _classificar_nivel2(self, historico: str) -> Optional[ResultadoClassificacao]:
+        """
+        Busca o lançamento mais parecido no Razão anterior. Usa
+        rapidfuzz.process.extractOne (implementado em C, com score_cutoff
+        para descartar candidatos fracos sem terminar de pontuá-los) contra
+        os textos já normalizados em __init__ — normalizar de novo os
+        mesmos N textos do Razão a cada um dos M lançamentos do extrato
+        (O(N*M) normalizações) era o principal gargalo de CPU do nível 2
+        em extratos grandes com Razão anterior extenso.
+        """
         if not self.mapa_historico or not historico:
             return None
 
-        melhor_item, melhor_score = None, 0.0
-        for item in self.mapa_historico:
-            score = _pontuacao_similaridade(historico, item["texto"])
-            if score > melhor_score:
-                melhor_score, melhor_item = score, item
-
-        if melhor_item is None or melhor_score < self.limiar_confianca:
+        historico_norm = _normalizar_texto(historico)
+        if not historico_norm:
             return None
+
+        if _rf_process is not None and _fuzz is not None:
+            resultado_match = _rf_process.extractOne(
+                historico_norm,
+                self._historico_normalizado,
+                scorer=_fuzz.token_sort_ratio,
+                score_cutoff=self.limiar_confianca,
+            )
+            if resultado_match is None:
+                return None
+            _, melhor_score, melhor_indice = resultado_match
+            melhor_item = self.mapa_historico[melhor_indice]
+        else:
+            melhor_item, melhor_score = None, 0.0
+            for indice, texto_norm in enumerate(self._historico_normalizado):
+                if not texto_norm:
+                    continue
+                score = (
+                    _fuzz.token_sort_ratio(historico_norm, texto_norm)
+                    if _fuzz is not None
+                    else difflib.SequenceMatcher(None, historico_norm, texto_norm).ratio() * 100.0
+                )
+                if score > melhor_score:
+                    melhor_score, melhor_item = score, self.mapa_historico[indice]
+            if melhor_item is None or melhor_score < self.limiar_confianca:
+                return None
 
         return ResultadoClassificacao(
             conta_debito=melhor_item.get("conta_debito", ""),
