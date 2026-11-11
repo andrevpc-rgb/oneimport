@@ -13,15 +13,17 @@ create extension if not exists "pgcrypto";
 -- sem depender do SDK do Supabase Auth.
 -- --------------------------------------------------------------------- --
 create table if not exists usuarios (
-    id              uuid primary key default gen_random_uuid(),
-    email           text not null unique,
-    senha_hash      text,
-    nome_escritorio text not null,
-    created_at      timestamptz not null default now()
+    id                      uuid primary key default gen_random_uuid(),
+    email                   text not null unique,
+    senha_hash              text,
+    codigo_recuperacao_hash text,
+    nome_escritorio         text not null,
+    created_at              timestamptz not null default now()
 );
 
--- migração segura para quem já criou a tabela usuarios antes do login existir
+-- migrações seguras para quem já criou a tabela usuarios em versões anteriores
 alter table usuarios add column if not exists senha_hash text;
+alter table usuarios add column if not exists codigo_recuperacao_hash text;
 
 -- --------------------------------------------------------------------- --
 -- empresas — clientes de cada escritório (tenant). Sempre presas a um

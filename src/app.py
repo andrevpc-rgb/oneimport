@@ -523,6 +523,26 @@ def _tela_login() -> None:
     )
     st.caption("Extrai, classifica e exporta extratos bancários — layout de saída configurável por empresa/ERP.")
 
+    # Escritório acabou de ser criado: mostra o código de recuperação UMA ÚNICA VEZ (só o hash
+    # fica salvo, não dá pra exibir de novo depois) antes de entrar no app — por isso o login
+    # só é efetivado quando o usuário confirmar que guardou o código, não automaticamente.
+    if st.session_state.get("_codigo_recuperacao_pendente"):
+        usuario_recem_criado = st.session_state["_usuario_recem_criado"]
+        st.success(f"Escritório '{usuario_recem_criado['nome_escritorio']}' criado!")
+        st.warning(
+            "Guarde este código de recuperação — é a única forma de redefinir sua senha sem precisar de "
+            "e-mail (este app não envia e-mail). Ele não poderá ser mostrado de novo depois desta tela."
+        )
+        st.code(st.session_state["_codigo_recuperacao_pendente"], language=None)
+        if st.button("Já salvei o código, continuar", type="primary"):
+            st.session_state["tenant_id"] = usuario_recem_criado["id"]
+            st.session_state["usuario_email"] = usuario_recem_criado["email"]
+            st.session_state["nome_escritorio"] = usuario_recem_criado["nome_escritorio"]
+            st.session_state.pop("_codigo_recuperacao_pendente", None)
+            st.session_state.pop("_usuario_recem_criado", None)
+            st.rerun()
+        return
+
     if not database.esta_configurado():
         st.error(
             "Banco de dados não configurado. Defina DATABASE_URL em src/.streamlit/secrets.toml "
@@ -547,6 +567,30 @@ def _tela_login() -> None:
                 except (database.UsuarioInvalidoError, database.ConfiguracaoAusenteError) as exc:
                     st.error(str(exc))
 
+        with st.popover("Esqueci minha senha"):
+            st.caption(
+                "Sem e-mail: use o código de recuperação mostrado quando o escritório foi criado "
+                "(ou gerado depois em 'Trocar senha', já logado)."
+            )
+            with st.form("form_recuperar_senha", clear_on_submit=True):
+                email_recuperar = st.text_input("E-mail", key="email_recuperar")
+                codigo_recuperar = st.text_input("Código de recuperação", key="codigo_recuperar")
+                senha_nova_recuperar = st.text_input("Nova senha", type="password", key="senha_nova_recuperar")
+                senha_nova_recuperar_confirma = st.text_input(
+                    "Confirmar nova senha", type="password", key="senha_nova_recuperar_confirma"
+                )
+                if st.form_submit_button("Redefinir senha"):
+                    if senha_nova_recuperar != senha_nova_recuperar_confirma:
+                        st.error("As senhas não coincidem.")
+                    else:
+                        try:
+                            database.UsuariosDB().redefinir_senha_com_codigo(
+                                email_recuperar, codigo_recuperar, senha_nova_recuperar
+                            )
+                            st.success("Senha redefinida! Já pode entrar com a nova senha acima.")
+                        except (database.UsuarioInvalidoError, database.ConfiguracaoAusenteError) as exc:
+                            st.error(str(exc))
+
     with aba_cadastrar:
         st.caption("Cria um novo escritório contábil — seus dados (empresas, regras, layouts) ficam isolados dos demais.")
         with st.form("form_cadastro_escritorio"):
@@ -561,10 +605,10 @@ def _tela_login() -> None:
                 else:
                     try:
                         usuario = database.UsuariosDB().cadastrar(email_novo, senha_nova, nome_escritorio_novo)
-                        st.session_state["tenant_id"] = usuario["id"]
-                        st.session_state["usuario_email"] = usuario["email"]
-                        st.session_state["nome_escritorio"] = usuario["nome_escritorio"]
-                        st.success(f"Escritório '{usuario['nome_escritorio']}' criado!")
+                        st.session_state["_usuario_recem_criado"] = {
+                            "id": usuario["id"], "email": usuario["email"], "nome_escritorio": usuario["nome_escritorio"],
+                        }
+                        st.session_state["_codigo_recuperacao_pendente"] = usuario["codigo_recuperacao"]
                         st.rerun()
                     except (database.UsuarioInvalidoError, database.ConfiguracaoAusenteError) as exc:
                         st.error(str(exc))
@@ -613,6 +657,26 @@ with st.sidebar:
                             st.success("Senha atualizada!")
                         except (database.UsuarioInvalidoError, database.ConfiguracaoAusenteError) as exc:
                             st.error(str(exc))
+
+            st.divider()
+            st.caption(
+                "Não tem (ou perdeu) o código de recuperação de senha de 'Esqueci minha senha'? Gere um novo abaixo "
+                "— o anterior, se existir, deixa de funcionar."
+            )
+            if st.button("Gerar novo código de recuperação", key="botao_gerar_codigo_recuperacao"):
+                try:
+                    st.session_state["_novo_codigo_recuperacao_gerado"] = database.UsuariosDB().gerar_novo_codigo_recuperacao(
+                        st.session_state["tenant_id"]
+                    )
+                except database.ConfiguracaoAusenteError as exc:
+                    st.error(str(exc))
+
+            if st.session_state.get("_novo_codigo_recuperacao_gerado"):
+                st.warning("Guarde este código agora — ele não será mostrado de novo depois.")
+                st.code(st.session_state["_novo_codigo_recuperacao_gerado"], language=None)
+                if st.button("Já salvei", key="botao_confirmar_codigo_recuperacao"):
+                    st.session_state.pop("_novo_codigo_recuperacao_gerado", None)
+                    st.rerun()
     with col_sair:
         if st.button("Sair", key="botao_logout"):
             for chave in ("tenant_id", "usuario_email", "nome_escritorio"):

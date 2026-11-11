@@ -172,6 +172,16 @@ def _verificar_senha(senha: str, senha_hash_armazenado: str) -> bool:
         return False
 
 
+# Sem 0/O/1/I — caracteres fáceis de confundir ao digitar um código de recuperação de volta.
+_ALFABETO_CODIGO_RECUPERACAO = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+
+def _gerar_codigo_recuperacao() -> str:
+    """Gera um código de recuperação de senha (ex.: 'A3F9-C1B2-E7K4') — alternativa ao 'esqueci minha senha' por e-mail, que este app não envia (sem dependência de serviço de e-mail)."""
+    bruto = "".join(secrets_modulo.choice(_ALFABETO_CODIGO_RECUPERACAO) for _ in range(12))
+    return "-".join(bruto[i : i + 4] for i in range(0, 12, 4))
+
+
 def tenant_id_ativo() -> Optional[str]:
     """Tenant ativo (sessão logada ou TENANT_ID), ou None se nenhum dos dois estiver disponível (nunca levanta exceção)."""
     try:
@@ -196,7 +206,7 @@ class UsuariosDB:
         self._engine = obter_engine()
 
     def cadastrar(self, email: str, senha: str, nome_escritorio: str) -> Dict[str, str]:
-        """Cria um novo escritório (tenant). Devolve {'id', 'email', 'nome_escritorio'}."""
+        """Cria um novo escritório (tenant). Devolve {'id', 'email', 'nome_escritorio', 'codigo_recuperacao'} — o código só existe em texto puro neste retorno (só o hash é salvo), então a tela de cadastro precisa mostrá-lo ao usuário agora, de uma vez."""
         email = (email or "").strip().lower()
         nome_escritorio = (nome_escritorio or "").strip()
         if not email or "@" not in email:
@@ -206,20 +216,32 @@ class UsuariosDB:
         if not nome_escritorio:
             raise UsuarioInvalidoError("Informe o nome do escritório.")
 
+        codigo_recuperacao = _gerar_codigo_recuperacao()
         sql = text(
-            """INSERT INTO usuarios (email, senha_hash, nome_escritorio)
-               VALUES (:email, :senha_hash, :nome_escritorio)
+            """INSERT INTO usuarios (email, senha_hash, codigo_recuperacao_hash, nome_escritorio)
+               VALUES (:email, :senha_hash, :codigo_recuperacao_hash, :nome_escritorio)
                RETURNING id, email, nome_escritorio"""
         )
         try:
             with self._engine.begin() as conn:
                 linha = conn.execute(
-                    sql, {"email": email, "senha_hash": _hash_senha(senha), "nome_escritorio": nome_escritorio}
+                    sql,
+                    {
+                        "email": email,
+                        "senha_hash": _hash_senha(senha),
+                        "codigo_recuperacao_hash": _hash_senha(codigo_recuperacao),
+                        "nome_escritorio": nome_escritorio,
+                    },
                 ).mappings().first()
         except IntegrityError as exc:
             raise UsuarioInvalidoError(f"Já existe um escritório cadastrado com o e-mail '{email}'.") from exc
 
-        return {"id": str(linha["id"]), "email": linha["email"], "nome_escritorio": linha["nome_escritorio"]}
+        return {
+            "id": str(linha["id"]),
+            "email": linha["email"],
+            "nome_escritorio": linha["nome_escritorio"],
+            "codigo_recuperacao": codigo_recuperacao,
+        }
 
     def autenticar(self, email: str, senha: str) -> Dict[str, str]:
         """Confere e-mail/senha. Devolve {'id', 'email', 'nome_escritorio'} ou levanta UsuarioInvalidoError."""
@@ -252,6 +274,52 @@ class UsuariosDB:
         sql_update = text("UPDATE usuarios SET senha_hash = :senha_hash WHERE id = :id")
         with self._engine.begin() as conn:
             conn.execute(sql_update, {"senha_hash": _hash_senha(nova_senha), "id": tenant_id})
+
+    def redefinir_senha_com_codigo(self, email: str, codigo_recuperacao: str, nova_senha: str) -> None:
+        """
+        Redefine a senha de `email` sem precisar de e-mail de verificação —
+        confere o código de recuperação gerado no cadastro (ou num escritório
+        já existente, gerado depois via gerar_novo_codigo_recuperacao).
+        Levanta UsuarioInvalidoError se o e-mail não existe, não tem código
+        de recuperação definido, o código está errado, ou a nova senha é fraca.
+        """
+        email = (email or "").strip().lower()
+        codigo_recuperacao = (codigo_recuperacao or "").strip().upper()
+        if not email or not codigo_recuperacao:
+            raise UsuarioInvalidoError("Informe e-mail e código de recuperação.")
+        if not nova_senha or len(nova_senha) < 6:
+            raise UsuarioInvalidoError("A nova senha precisa ter pelo menos 6 caracteres.")
+
+        sql_busca = text("SELECT id, codigo_recuperacao_hash FROM usuarios WHERE email = :email")
+        with self._engine.connect() as conn:
+            linha = conn.execute(sql_busca, {"email": email}).mappings().first()
+
+        # mesma mensagem genérica em qualquer caso de falha — não revela se o e-mail existe
+        # nem se há código de recuperação cadastrado para ele.
+        if (
+            linha is None
+            or not linha["codigo_recuperacao_hash"]
+            or not _verificar_senha(codigo_recuperacao, linha["codigo_recuperacao_hash"])
+        ):
+            raise UsuarioInvalidoError("E-mail ou código de recuperação incorretos.")
+
+        sql_update = text("UPDATE usuarios SET senha_hash = :senha_hash WHERE id = :id")
+        with self._engine.begin() as conn:
+            conn.execute(sql_update, {"senha_hash": _hash_senha(nova_senha), "id": linha["id"]})
+
+    def gerar_novo_codigo_recuperacao(self, tenant_id: str) -> str:
+        """
+        Gera e grava um novo código de recuperação para `tenant_id`,
+        substituindo o anterior — para quem criou a conta antes dessa
+        funcionalidade existir, ou perdeu o código antigo. Devolve o código
+        em texto puro: é a única vez que ele existe fora do hash salvo, então
+        quem chamar isto precisa mostrá-lo ao usuário imediatamente.
+        """
+        codigo_recuperacao = _gerar_codigo_recuperacao()
+        sql = text("UPDATE usuarios SET codigo_recuperacao_hash = :hash WHERE id = :id")
+        with self._engine.begin() as conn:
+            conn.execute(sql, {"hash": _hash_senha(codigo_recuperacao), "id": tenant_id})
+        return codigo_recuperacao
 
 
 def _decodificar_mapeamento(valor) -> List[Dict[str, str]]:
